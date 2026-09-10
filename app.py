@@ -218,8 +218,8 @@ def main():
                       icon=folium.Icon(color="blue", icon="home", prefix="fa")
         ).add_to(m)
 
-    # 実勢価格レイヤー（取引事例＝紫の点 / 地価公示＝オレンジのピン）
-    ml.add_market_markers(m, _mkt.get("tori_near"), _mkt.get("kouji_near"))
+    # 実勢価格レイヤー（取引事例＝紫の点 / 地価公示＝橙ピン / 基準地＝緑ピン）
+    ml.add_market_markers(m, _mkt.get("tori_near"), _mkt.get("kouji_near"), _mkt.get("kijun_near"))
 
     st.markdown("**③ 地図で確認**")
     st_folium(m, width="100%", height=600)

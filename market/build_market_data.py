@@ -347,12 +347,78 @@ def build_kouji(src: Path, munis: dict[str, str], cache: dict) -> pd.DataFrame:
             print(f"    {i}/{len(df)}"); _save_cache(cache)
     _save_cache(cache)
     out = pd.DataFrame(recs)
-    # 同一標準地が地価公示・地価調査の両方で登録される（共通地点）→ 住所で1本化
+    # 地価公示は1標準地を2名の鑑定士が評価する（1地点2鑑定）ため住所が2行ずつ。
+    # 数値は2鑑定の平均、テキストは片方を採用して1本化する。
     if not out.empty:
         before = len(out)
-        out = out.sort_values("公示m2単価円", ascending=False).drop_duplicates("住所", keep="first")
-        print(f"[kouji] 共通地点の重複を統合: {before} → {len(out)}")
+        num_cols = ["公示m2単価円", "相続税路線価", "地積m2", "前面道路幅員m", "建蔽率", "容積率", "交通距離m"]
+        agg = {c: "mean" for c in num_cols}
+        agg.update({c: "first" for c in out.columns if c not in num_cols and c != "住所"})
+        out = out.groupby("住所", as_index=False).agg(agg)
+        out["公示m2単価円"] = out["公示m2単価円"].round(0)
+        out["坪単価万円"] = (out["公示m2単価円"] * SQM_PER_TSUBO / YEN_PER_MAN).round(1)
+        print(f"[kouji] 1地点2鑑定を平均で統合: {before} → {len(out)}")
     return out.sort_values("住所").reset_index(drop=True)
+
+
+# ──────────────────────────────────────────────────────────────
+# 3) 基準地（都道府県地価調査）— 国土数値情報 L02 GeoJSON（座標入り）
+# ──────────────────────────────────────────────────────────────
+# L02 属性コード（国土数値情報 L02 v2.x）。座標は geometry から取得。
+L02 = {
+    "調査年": "L02_005",
+    "m2単価円": "L02_006",      # 当年の地価調査価格（円/㎡）
+    "変動率": "L02_007",        # 対前年変動率（％）
+    "市区町村コード": "L02_020",
+    "所在地": "L02_022",
+    "住居表示": "L02_023",
+    "地積m2": "L02_024",
+    "利用現況": "L02_025",
+    "前面道路幅員": "L02_039",
+    "地域概要": "L02_043",
+    "最寄駅": "L02_044",
+    "駅距離m": "L02_045",
+    "用途地域": "L02_046",
+    "区域区分": "L02_048",
+    "建蔽率": "L02_050",
+    "容積率": "L02_051",
+}
+
+
+def build_kijunchi(src: Path, munis: dict[str, str]) -> pd.DataFrame:
+    path = _find_file(src, "L02-*.geojson", "*L02*.geojson")
+    if not path:
+        print("[kijun] L02 GeoJSON が無いためスキップ（基準地レイヤーは作成されません）")
+        return pd.DataFrame()
+    print(f"[kijun] read {path.name}")
+    gj = json.loads(path.read_text(encoding="utf-8"))
+    recs = []
+    for ft in gj.get("features", []):
+        p = ft.get("properties", {})
+        if p.get(L02["市区町村コード"]) not in munis:
+            continue
+        lon, lat = ft["geometry"]["coordinates"]
+        m2 = pd.to_numeric(p.get(L02["m2単価円"]), errors="coerce")
+        addr = str(p.get(L02["所在地"], "")).replace("　", " ").strip()
+        recs.append({
+            "住所": addr,
+            "lat": round(lat, 7), "lon": round(lon, 7), "位置精度": "exact",
+            "調査年": p.get(L02["調査年"]),
+            "基準地m2単価円": m2,
+            "坪単価万円": round(m2 * SQM_PER_TSUBO / YEN_PER_MAN, 1) if pd.notna(m2) else None,
+            "変動率": pd.to_numeric(p.get(L02["変動率"]), errors="coerce"),
+            "地積m2": pd.to_numeric(p.get(L02["地積m2"]), errors="coerce"),
+            "前面道路幅員m": pd.to_numeric(p.get(L02["前面道路幅員"]), errors="coerce"),
+            "用途地域": p.get(L02["用途地域"]),
+            "区域区分": p.get(L02["区域区分"]),
+            "建蔽率": pd.to_numeric(p.get(L02["建蔽率"]), errors="coerce"),
+            "容積率": pd.to_numeric(p.get(L02["容積率"]), errors="coerce"),
+            "最寄駅": p.get(L02["最寄駅"]),
+            "駅距離m": pd.to_numeric(p.get(L02["駅距離m"]), errors="coerce"),
+            "利用現況": p.get(L02["利用現況"]),
+        })
+    out = pd.DataFrame(recs).sort_values("住所").reset_index(drop=True)
+    return out
 
 
 # ──────────────────────────────────────────────────────────────
@@ -383,6 +449,14 @@ def main() -> None:
         print(f"✅ {p.name}  {len(kouji)} 行（座標exact {ex} / approx {len(kouji)-ex}）")
         print(f"   公示坪単価 中央値 {kouji['坪単価万円'].median():.1f} 万円 / "
               f"範囲 {kouji['坪単価万円'].min():.1f}–{kouji['坪単価万円'].max():.1f}")
+
+    kijun = build_kijunchi(args.src, munis)
+    if not kijun.empty:
+        p = APP_DIR / "market_kijunchi.csv"
+        kijun.to_csv(p, index=False, encoding="utf-8-sig")
+        print(f"✅ {p.name}  {len(kijun)} 点（基準地・地価調査）")
+        print(f"   基準地坪単価 中央値 {kijun['坪単価万円'].median():.1f} 万円 / "
+              f"範囲 {kijun['坪単価万円'].min():.1f}–{kijun['坪単価万円'].max():.1f}")
 
     _save_cache(cache)
     print("done.")

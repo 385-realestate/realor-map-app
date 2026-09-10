@@ -22,6 +22,7 @@ import folium
 APP_DIR = Path(__file__).resolve().parent
 TORIHIKI_CSV = APP_DIR / "market_torihiki.csv"
 KOUJI_CSV = APP_DIR / "market_kouji.csv"
+KIJUN_CSV = APP_DIR / "market_kijunchi.csv"
 
 
 # ──────────────────────────────────────────────────────────────
@@ -33,8 +34,8 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 @st.cache_data(show_spinner=False)
-def load_market() -> tuple[pd.DataFrame, pd.DataFrame]:
-    """(取引事例, 地価公示) を返す。無ければ空DataFrame。"""
+def load_market() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """(取引事例, 地価公示, 基準地) を返す。無ければ空DataFrame。"""
     def _read(p: Path) -> pd.DataFrame:
         if not p.exists():
             return pd.DataFrame()
@@ -47,16 +48,17 @@ def load_market() -> tuple[pd.DataFrame, pd.DataFrame]:
 
     tori = _read(TORIHIKI_CSV)
     kouji = _read(KOUJI_CSV)
-    for df in (tori, kouji):
+    kijun = _read(KIJUN_CSV)
+    for df in (tori, kouji, kijun):
         if not df.empty:
             for c in ("lat", "lon", "坪単価万円"):
                 if c in df.columns:
                     df[c] = pd.to_numeric(df[c], errors="coerce")
-    return tori, kouji
+    return tori, kouji, kijun
 
 
 def market_available() -> bool:
-    return TORIHIKI_CSV.exists() or KOUJI_CSV.exists()
+    return TORIHIKI_CSV.exists() or KOUJI_CSV.exists() or KIJUN_CSV.exists()
 
 
 # ──────────────────────────────────────────────────────────────
@@ -143,6 +145,7 @@ def add_market_markers(
     fmap: folium.Map,
     tori_near: pd.DataFrame,
     kouji_near: pd.DataFrame,
+    kijun_near: pd.DataFrame | None = None,
     max_points: int = 60,
 ) -> None:
     if tori_near is not None and not tori_near.empty:
@@ -186,6 +189,30 @@ def add_market_markers(
             ).add_to(fg)
         fg.add_to(fmap)
 
+    if kijun_near is not None and not kijun_near.empty:
+        fg = folium.FeatureGroup(name="基準地（地価調査）", show=True)
+        for _, r in kijun_near.iterrows():
+            t = _num(r.get("坪単価万円"))
+            m2 = _num(r.get("基準地m2単価円"))
+            hen = _num(r.get("変動率"))
+            rows = [f"<b>基準地（地価調査）</b>", f"{r.get('住所','')}"]
+            if t is not None:
+                rows.append(f"基準地坪単価：<b>{t:.1f} 万円/坪</b>")
+            if m2 is not None:
+                rows.append(f"基準地㎡単価：{m2:,.0f} 円/㎡")
+            if hen is not None:
+                rows.append(f"対前年変動率：{hen:+.1f} %")
+            rows += [f"用途地域：{r.get('用途地域','-')}",
+                     f"建蔽/容積：{r.get('建蔽率','-')} / {r.get('容積率','-')} %",
+                     f"最寄駅：{r.get('最寄駅','-')} {r.get('駅距離m','-')} m"]
+            folium.Marker(
+                [r["lat"], r["lon"]],
+                icon=folium.Icon(color="green", icon="flag", prefix="fa"),
+                popup=folium.Popup("<br>".join(rows), max_width=260),
+                tooltip=(f"基準地 {t:.1f}万/坪" if t is not None else "基準地"),
+            ).add_to(fg)
+        fg.add_to(fmap)
+
     try:
         folium.LayerControl(collapsed=True).add_to(fmap)
     except Exception:
@@ -206,17 +233,21 @@ def render_market_panel(
     相場サマリを描画し、一覧の乖離率計算に使うベンチマークを返す。
     戻り値: {"benchmark": float|None, "stats": dict, "tori_near": df, "kouji_near": df, "nearest_kouji": dict|None}
     """
-    tori, kouji = load_market()
-    if tori.empty and kouji.empty:
-        st.info("実勢価格データ（market_torihiki.csv / market_kouji.csv）が未生成です。`python market/build_market_data.py` を実行してください。")
+    tori, kouji, kijun = load_market()
+    if tori.empty and kouji.empty and kijun.empty:
+        st.info("実勢価格データ（market_*.csv）が未生成です。`python market/build_market_data.py` を実行してください。")
         return {"benchmark": None, "stats": {}, "tori_near": pd.DataFrame(),
-                "kouji_near": pd.DataFrame(), "nearest_kouji": None}
+                "kouji_near": pd.DataFrame(), "kijun_near": pd.DataFrame(),
+                "nearest_kouji": None, "nearest_kijun": None}
 
     tori_near, stats = nearby_torihiki(tori, clat, clon, radius_km, land_only=True)
     nk = nearest_kouji(kouji, clat, clon)
     kouji_near = kouji_within(kouji, clat, clon, max(radius_km, 3.0))
+    nj = nearest_kouji(kijun, clat, clon)                       # 汎用（最寄り1点）
+    kijun_near = kouji_within(kijun, clat, clon, max(radius_km, 3.0))
 
-    benchmark = stats.get("median") or (nk.get("坪単価万円") if nk else None)
+    benchmark = stats.get("median") or (nk.get("坪単価万円") if nk else None) \
+        or (nj.get("坪単価万円") if nj else None)
 
     st.markdown("### 💰 周辺の実勢相場")
     if stats:
@@ -232,12 +263,23 @@ def render_market_panel(
     if nk is not None:
         d = nk.get("距離km", 0.0)
         tsubo = nk.get("坪単価万円")
-        line = f"🏛️ **最寄りの地価公示**（{d:.1f}km） {nk.get('住所','')}"
+        line = f"🏛️ **最寄りの地価公示**（{d:.1f}km・1/1時点） {nk.get('住所','')}"
         if pd.notna(tsubo):
             line += f" ／ 公示坪単価 **{tsubo:.1f} 万円**"
         yoto = nk.get("用途地域")
         if isinstance(yoto, str) and yoto:
             line += f" ／ {yoto}"
+        st.markdown(line)
+
+    if nj is not None:
+        d = nj.get("距離km", 0.0)
+        tsubo = nj.get("坪単価万円")
+        hen = nj.get("変動率")
+        line = f"🚩 **最寄りの基準地**（{d:.1f}km・7/1時点） {nj.get('住所','')}"
+        if pd.notna(tsubo):
+            line += f" ／ 基準地坪単価 **{tsubo:.1f} 万円**"
+        if pd.notna(hen):
+            line += f" ／ 前年比 {float(hen):+.1f}%"
         st.markdown(line)
 
     if benchmark:
@@ -248,5 +290,7 @@ def render_market_panel(
         "stats": stats,
         "tori_near": tori_near,
         "kouji_near": kouji_near,
+        "kijun_near": kijun_near,
         "nearest_kouji": nk,
+        "nearest_kijun": nj,
     }
