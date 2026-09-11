@@ -131,6 +131,53 @@ def deviation_label(pct: float | None) -> str:
 
 
 # ──────────────────────────────────────────────────────────────
+# 物件データの価格ガード（元CSVの登録価格が約半数破損しているため）
+# ──────────────────────────────────────────────────────────────
+def reconcile_land_price(price_man, tsubo_unit_man, area_m2, tol: float = 0.20) -> pd.DataFrame:
+    """
+    物件の (登録価格[万円], 坪単価[万円/坪], 土地面積[㎡]) の整合を取り、
+    確定した 価格万円 / 坪単価万円 と確度フラグを返す。
+
+    確度:  ""  = 登録価格と坪単価が整合（そのまま採用）
+          "≈" = 登録価格が不整合 → 坪単価×坪 で総額を推定
+          "⚠" = どちらも当てにならない（要確認・周辺相場比の対象外）
+    """
+    import numpy as np
+
+    p = pd.to_numeric(pd.Series(price_man).astype(str).str.replace(",", ""), errors="coerce")
+    u = pd.to_numeric(pd.Series(tsubo_unit_man).astype(str).str.replace(",", ""), errors="coerce")
+    a = pd.to_numeric(pd.Series(area_m2).astype(str).str.replace(",", ""), errors="coerce") / 3.305785
+    p.index = u.index = a.index = range(len(p))
+
+    p_from_u = u * a
+    out_p = p.copy()
+    out_u = pd.Series(np.nan, index=p.index)
+    flag = pd.Series("⚠", index=p.index)
+
+    consistent = p.gt(0) & p_from_u.gt(0) & ((p - p_from_u).abs() <= tol * p_from_u.clip(lower=1))
+    out_u[consistent] = (p / a)[consistent]
+    flag[consistent] = ""
+
+    u_ok = (~consistent) & u.gt(0) & u.lt(500) & a.gt(0)
+    out_p[u_ok] = p_from_u[u_ok].round(0)
+    out_u[u_ok] = u[u_ok]
+    flag[u_ok] = "≈"
+
+    p_ok = (~consistent) & (~u_ok) & p.between(1, 300000) & a.gt(0)
+    out_u[p_ok] = (p / a)[p_ok]
+    flag[p_ok] = ""
+
+    rest = (~consistent) & (~u_ok) & (~p_ok) & a.gt(0)
+    out_u[rest] = (p / a)[rest]
+
+    return pd.DataFrame({
+        "価格万円": out_p.round(0),
+        "坪単価万円": out_u.round(1),
+        "確度": flag,
+    })
+
+
+# ──────────────────────────────────────────────────────────────
 # 地図マーカー
 # ──────────────────────────────────────────────────────────────
 def _num(v):

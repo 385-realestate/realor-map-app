@@ -117,10 +117,22 @@ def load_data(path: Path) -> pd.DataFrame:
         df["土地面積（坪）"].astype(str).str.replace(",", ""), errors="coerce"
     )
 
-    # 5. 坪単価計算
-    price_col = "登録価格（万円）" if "登録価格（万円）" in df.columns else "価格(万円)"
-    df[price_col] = pd.to_numeric(df[price_col].astype(str).str.replace(",", ""), errors="coerce")
-    df["坪単価（万円/坪）"] = (df[price_col] / df["土地面積（坪）"]).round(1)
+    # 5. 価格ガード＋坪単価計算
+    #    元CSVの「登録価格（万円）」は約半数の行で破損（円混入・桁二重）。
+    #    生列（登録価格・坪単価・土地面積㎡）から整合を取り直す。
+    if {"登録価格（万円）", "坪単価（万円）", "土地面積（㎡）"} <= set(df.columns):
+        _rec = ml.reconcile_land_price(
+            df["登録価格（万円）"], df["坪単価（万円）"], df["土地面積（㎡）"]
+        )
+        df = df.reset_index(drop=True)
+        df["登録価格（万円）"] = _rec["価格万円"].values
+        df["坪単価（万円/坪）"] = _rec["坪単価万円"].values
+        df["価格確度"] = _rec["確度"].values
+    else:
+        price_col = "登録価格（万円）" if "登録価格（万円）" in df.columns else "価格(万円)"
+        df[price_col] = pd.to_numeric(df[price_col].astype(str).str.replace(",", ""), errors="coerce")
+        df["坪単価（万円/坪）"] = (df[price_col] / df["土地面積（坪）"]).round(1)
+        df["価格確度"] = ""
 
     # 6. 日付列の統一（候補を広げる）
     date_candidates = ("日付", "掲載日", "更新日", "掲載開始日", "公開日", "最終更新日", "更新日時")
@@ -194,17 +206,23 @@ flt["日付"] = flt["日付"].apply(lambda x: x if x else "-")
 _mkt = ml.render_market_panel(center_lat, center_lon, radius_km, compact=True)
 _bench = _mkt.get("benchmark")
 if _bench:
-    flt["周辺相場比"] = flt["坪単価（万円/坪）"].apply(
-        lambda p: ml.deviation_label(ml.deviation_pct(p, _bench))
+    flt["周辺相場比"] = flt.apply(
+        lambda r: "-" if r.get("価格確度") == "⚠"
+        else ml.deviation_label(ml.deviation_pct(r["坪単価（万円/坪）"], _bench)),
+        axis=1,
     )
 
 # ────────────────────────────────────────────────
 # 一覧テーブル（行クリック＝選択 → ピン強調）
 # ------------------------------------------------
 st.markdown(f"**② 検索結果：{len(flt)} 件**")
+_warn = int((flt.get("価格確度") == "⚠").sum()) if "価格確度" in flt else 0
+_est = int((flt.get("価格確度") == "≈").sum()) if "価格確度" in flt else 0
+if _warn or _est:
+    st.caption(f"⚠ 価格要確認 {_warn} 件 ／ ≈ 坪単価から総額推定 {_est} 件（元データ破損のため）")
 
 cols_order = [
-    "住所", "日付", "距離(km)", "登録価格（万円）", "坪単価（万円/坪）", "周辺相場比",
+    "住所", "日付", "距離(km)", "登録価格（万円）", "価格確度", "坪単価（万円/坪）", "周辺相場比",
     "土地面積（坪）", "用途地域", "取引態様", "登録会員", "TEL",
 ]
 cols = [c for c in cols_order if c in flt.columns]
@@ -282,7 +300,8 @@ for idx, r in flt.iterrows():
     popup_parts = [f"<b>{r.get('住所', '-')}</b>"]
     if date_txt:
         popup_parts.append(f"日付：{date_txt}")
-    popup_parts.append(f"価格：{price_fmt} 万円" if price_fmt != "-" else "価格：要確認")
+    _cmark = {"≈": "（坪単価から推定）", "⚠": "（要確認）"}.get(r.get("価格確度", ""), "")
+    popup_parts.append(f"価格：{price_fmt} 万円{_cmark}" if price_fmt != "-" else "価格：要確認")
     if pd.notna(r.get("土地面積（坪）")):
         popup_parts.append(f"面積：{float(r['土地面積（坪）']):.1f} 坪")
     if pd.notna(r.get("坪単価（万円/坪）")):

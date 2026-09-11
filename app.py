@@ -141,16 +141,30 @@ def main():
 
     if not CSV_PATH.exists():
         st.error(f"{CSV_PATH} が見つかりません"); return
-    df = standardize_columns(load_csv(CSV_PATH))
+    _raw = load_csv(CSV_PATH).reset_index(drop=True)
+    df = standardize_columns(_raw.copy()).reset_index(drop=True)
 
-    # 数値変換＋面積・単価計算
-    df["価格(万円)"] = pd.to_numeric(df["価格(万円)"].astype(str).str.replace(",",""), errors="coerce")
-    if "土地面積(坪)" not in df.columns and "土地面積(㎡)" in df.columns:
-        df["土地面積(坪)"] = (pd.to_numeric(df["土地面積(㎡)"], errors="coerce")/3.305785).round(2)
-    if "土地面積(㎡)" not in df.columns and "土地面積(坪)" in df.columns:
-        df["土地面積(㎡)"] = (pd.to_numeric(df["土地面積(坪)"], errors="coerce")*3.305785).round(2)
-    df["土地面積(坪)"]   = pd.to_numeric(df["土地面積(坪)"], errors="coerce").round(2)
-    df["坪単価(万円/坪)"] = (df["価格(万円)"] / df["土地面積(坪)"]).round(1)
+    # ── 価格ガード ───────────────────────────────────────────────
+    # 元CSV(住所付き_緯度経度付きデータ_1.csv)の「登録価格（万円）」は約半数の行で
+    # 破損（円混入・桁二重）。生列の 登録価格／坪単価／土地面積㎡ から整合を取り直す。
+    if {"登録価格（万円）", "坪単価（万円）", "土地面積（㎡）"} <= set(_raw.columns):
+        _rec = ml.reconcile_land_price(
+            _raw["登録価格（万円）"], _raw["坪単価（万円）"], _raw["土地面積（㎡）"]
+        )
+        df["価格(万円)"]     = _rec["価格万円"].values
+        df["坪単価(万円/坪)"] = _rec["坪単価万円"].values
+        df["価格確度"]       = _rec["確度"].values
+        df["土地面積(坪)"]   = (
+            pd.to_numeric(_raw["土地面積（㎡）"].astype(str).str.replace(",", ""), errors="coerce")
+            / 3.305785
+        ).round(1).values
+    else:
+        df["価格(万円)"] = pd.to_numeric(df["価格(万円)"].astype(str).str.replace(",", ""), errors="coerce")
+        if "土地面積(坪)" not in df.columns and "土地面積(㎡)" in df.columns:
+            df["土地面積(坪)"] = (pd.to_numeric(df["土地面積(㎡)"], errors="coerce") / 3.305785).round(2)
+        df["土地面積(坪)"]   = pd.to_numeric(df["土地面積(坪)"], errors="coerce").round(2)
+        df["坪単価(万円/坪)"] = (df["価格(万円)"] / df["土地面積(坪)"]).round(1)
+        df["価格確度"]       = ""
 
     # 住所入力→距離
     st.subheader("① 検索中心の住所を入力")
@@ -182,13 +196,19 @@ def main():
     _mkt = ml.render_market_panel(clat, clon, radius)
     _bench = _mkt.get("benchmark")
     if _bench:
-        df_flt["周辺相場比"] = df_flt["坪単価(万円/坪)"].apply(
-            lambda p: ml.deviation_label(ml.deviation_pct(p, _bench))
+        df_flt["周辺相場比"] = df_flt.apply(
+            lambda r: "-" if r.get("価格確度") == "⚠"
+            else ml.deviation_label(ml.deviation_pct(r["坪単価(万円/坪)"], _bench)),
+            axis=1,
         )
 
     # テーブル表示：価格 → 坪単価 → 周辺相場比 → 土地面積
     st.subheader(f"② 検索結果：{len(df_flt):,} 件")
-    cols_order = ["所在地","日付","距離(km)","価格(万円)","坪単価(万円/坪)","周辺相場比","土地面積(坪)","登録会員","TEL"]
+    _warn = int((df_flt.get("価格確度") == "⚠").sum()) if "価格確度" in df_flt else 0
+    _est = int((df_flt.get("価格確度") == "≈").sum()) if "価格確度" in df_flt else 0
+    if _warn or _est:
+        st.caption(f"⚠ 価格要確認 {_warn} 件 ／ ≈ 坪単価から総額を推定 {_est} 件（元データの登録価格に破損があるため）")
+    cols_order = ["所在地","日付","距離(km)","価格(万円)","価格確度","坪単価(万円/坪)","周辺相場比","土地面積(坪)","登録会員","TEL"]
     display_cols = [c for c in cols_order if c in df_flt.columns]
     st.dataframe(df_flt[display_cols], height=300)
 
@@ -202,11 +222,13 @@ def main():
 
     for _, r in df_flt.iterrows():
         raw = r["価格(万円)"]
-        price = f"{float(raw):,}" if pd.notna(raw) else "-"
+        _conf = r.get("価格確度", "")
+        _cmark = {"≈": "（坪単価から推定）", "⚠": "（要確認）"}.get(_conf, "")
+        price = f"{float(raw):,.0f}" if pd.notna(raw) else "-"
         popup = (
             f"<b>{r['所在地']}</b><br>"
             + (f"日付：{r.get('日付')}<br>" if "日付" in r else "")
-            + f"価格：{price} 万円<br>"
+            + f"価格：{price} 万円{_cmark}<br>"
             + f"坪単価：{r['坪単価(万円/坪)']:.1f} 万円/坪<br>"
             + f"土地面積：{r['土地面積(坪)']:.1f} 坪<br>"
             + f"登録会員：{r.get('登録会員','-')}<br>"
